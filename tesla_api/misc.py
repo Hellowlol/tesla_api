@@ -2,8 +2,9 @@
 from typing import Optional, Union
 
 
-class Dict(dict): # type: ignore
+class Dict(dict):  # type: ignore
     """Just a helper that includes a tip in KeyError excetion to the user."""
+
     def __init__(self, arg):
         super().__init__(arg)
 

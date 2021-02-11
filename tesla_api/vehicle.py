@@ -294,7 +294,7 @@ class Vehicle:
             delay = timeout / 100
 
         async def _wake():
-            """Summary"""
+            """real wake command."""
             part_url = f"vehicles/{self.id}/wake_up"
             state = await self._api_client.post(part_url)
             self._update_vehicle(state)

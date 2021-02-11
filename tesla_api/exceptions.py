@@ -12,3 +12,13 @@ class ApiError(Exception):
 class VehicleUnavailableError(Exception):
     def __init__(self):
         super().__init__('Vehicle failed to wake up.')
+
+
+class MissingCredentials(Exception):
+    def __init__(self, error):
+        super().__init__("Missing username and/or password")
+
+
+class AuthenticationBlockedError(Exception):
+    def __init__(self, error):
+        super().__init__('Authentication to the Tesla API failed: {}'.format(error))
