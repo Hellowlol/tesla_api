@@ -189,9 +189,10 @@ class TeslaApiClient:
             "response_type": "code",
             "scope": "openid email offline_access",
             "state": state,
+            # login_hint: self._email
         }
 
-        async with self._session.get(V3_AUTH_TOKEN_URL, headers=_headers, params=query) as resp:
+        async with self._session.get(V3_AUTH_TOKEN_URL, params=query) as resp:
             response_page = await resp.text()
             if resp.status == 403 and "<title>Tesla - Error</title>":
                 _LOGGER.debug("%s", response_page)
@@ -199,6 +200,9 @@ class TeslaApiClient:
             elif resp.status != 200 and not "<title>" in response_page:
                 raise AuthenticationError
             # Should add some other check here.
+            elif resp.status == 303:
+                # see other, make sure we update the V3_AUTH_TOKEN_URL for the correct region.
+                pass
 
         input_fields = (
             f.group(1) for f in re.finditer(r"<input ([^>]+)>", response_page)
