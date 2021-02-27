@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import secrets
+from copy import deepcopy
 from datetime import datetime, timedelta
 from pprint import pprint
 from urllib.parse import parse_qs, urlparse
@@ -18,9 +19,9 @@ from .exceptions import (ApiError, AuthenticationBlockedError,
 from .vehicle import Vehicle
 
 TESLA_API_BASE_URL = "https://owner-api.teslamotors.com/"
-API_URL = "f{TESLA_API_BASE_URL}api/1"
+API_URL = f"{TESLA_API_BASE_URL}api/1"
 
-V2TOKEN_URL = "f{TESLA_API_BASE_URL}oauth/token"
+V2TOKEN_URL = f"{TESLA_API_BASE_URL}oauth/token"
 V3TOKEN_URL = "https://auth.tesla.com/oauth2/v3/token"
 
 V3_AUTH_TOKEN_URL = "https://auth.tesla.com/oauth2/v3/authorize"
@@ -163,7 +164,7 @@ class TeslaApiClient:
                 # TODO fix the exception.
                 ffs = await verify_rsp.text()
                 _LOGGER.debug("Shit happend during verify mfa")
-                _LOGGER.debug(ffs)
+                _LOGGER.exception(ffs)
                 raise
 
     async def get_authorization_code(self, email, password) -> str:
@@ -182,7 +183,7 @@ class TeslaApiClient:
         state = secrets.token_urlsafe(64)
 
         query = {
-            "client_id": "V3OAUTH_CLIENT_ID",
+            "client_id": V3OAUTH_CLIENT_ID,
             "code_challenge": code_challenge.decode(),
             "code_challenge_method": "S256",
             "redirect_uri": "https://auth.tesla.com/void/callback",
@@ -222,13 +223,17 @@ class TeslaApiClient:
         # This inlined as we need access to the same form data.
         async def do_request_auth():
             async with self._session.post(
-                V3_AUTH_TOKEN_URL, data=form_data, params=query, headers={}, allow_redirects=False
+                V3_AUTH_TOKEN_URL,
+                data=form_data,
+                params=query,
+                headers={},
+                allow_redirects=False,
             ) as resp:
                 nonlocal TRIES
                 TRIES += 1
                 if resp.status == 401:
                     raise AuthenticationError("Incorrect login")
-                elif resp.status  == 403:
+                elif resp.status == 403:
                     raise AuthenticationBlockedError("403")
                 if resp.status == 200:
                     page = await resp.text()
@@ -239,7 +244,7 @@ class TeslaApiClient:
                             # retry request
                             if TRIES > 2:
                                 _LOGGER.debug("Tried %s times, stopping", TRIES)
-                                # Just so we dont block over selfs.
+                                # Just so we don't block the account if a mistake was made.
                                 return
                             return await do_request_auth()
 
@@ -268,24 +273,21 @@ class TeslaApiClient:
             return
 
         oauth = {
-            "client_id": "V3OAUTH_CLIENT_ID",
+            "client_id": V3OAUTH_CLIENT_ID,
             "grant_type": "authorization_code",
             "code": code,
             "code_verifier": self.code_verifier,
             "redirect_uri": "https://auth.tesla.com/void/callback",
         }
 
-        auth = await self._session.post(
+        req = await self._session.post(
             V3_AUTH_TOKEN_URL_EXCHANGE,
             data=oauth,
         )
-        data = await auth.json()
-        # Just if we can check that refresh works in a reasonable timeframe
-        self._ttl_short_token = datetime.utcnow() + timedelta(seconds=60)
-        # Keep this one remove then one over.
-        # self._ttl_short_token = datetime.utcnow() + timedelta(
-        #    seconds=auth.get("expires_in", 300)
-        # )
+        data = await req.json()
+        self._ttl_short_token = datetime.utcnow() + timedelta(
+            seconds=data.get("expires_in", 300)
+        )
 
         return data
 
@@ -297,7 +299,7 @@ class TeslaApiClient:
             return
         _LOGGER.debug("Refreshing access token with refresh_token")
         oauth = {
-            "client_id": "V3OAUTH_CLIENT_ID",
+            "client_id": V3OAUTH_CLIENT_ID,
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
             "scope": "openid email offline_access",
@@ -308,11 +310,10 @@ class TeslaApiClient:
         )
 
         # patched to test refresh
-        self._ttl_short_token = datetime.utcnow() + timedelta(seconds=60)
-        # Keep this one remove the one over.
-        # self._ttl_short_token = datetime.utcnow() + timedelta(
-        #    seconds=auth.get("expires_in", 300)
-        # )
+        # self._ttl_short_token = datetime.utcnow() + timedelta(seconds=60)
+        self._ttl_short_token = datetime.utcnow() + timedelta(
+            seconds=auth.get("expires_in", 300)
+        )
         data = await auth.json()
 
         if self.long_live_token is True:
@@ -320,7 +321,6 @@ class TeslaApiClient:
             lt_token_data = await self.get_bearer_token(data["access_token"])
             # refresh token seems to be valid over the 300 sec that the v3 access token is valid.
             lt_token_data["refresh_token"] = refresh_token
-
             return lt_token_data
         return data
 
@@ -332,7 +332,7 @@ class TeslaApiClient:
             return
         _LOGGER.debug("Exchanging access_token to get a bearer token.")
         oauth = {
-            "client_id": OAUTH_CLIENT_ID,
+            "client_id": V2OAUTH_CLIENT_ID,
             "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
         }
         head = {
@@ -349,7 +349,7 @@ class TeslaApiClient:
         headers = self._get_headers()
         response_json = {}
 
-        _LOGGER.debug("url %s headers: %s params:%s", url, headers, params)
+        #_LOGGER.debug("url %s headers: %s params:%s", url, headers, params)
 
         async with self._session.get(url, headers=headers, params=params) as resp:
             response_json = await resp.json()
@@ -383,9 +383,12 @@ class TeslaApiClient:
     async def check_auth(self):
         now = datetime.utcnow()
 
-        if self._sso_oauth.get("access_token") and (not self._code and not self._email and not self._password):
-            _LOGGER.debug("Access granted directly using exteral access token with no means to refresh it.")
-
+        if self._sso_oauth.get("access_token") and (
+            not self._code and not self._email and not self._password
+        ):
+            _LOGGER.debug(
+                "Access granted directly using exteral access token with no means to refresh it."
+            )
 
         if now > self.expires_in:
             _LOGGER.debug("The oauth token expired at %s", self.expires_in)
@@ -429,30 +432,26 @@ class TeslaApiClient:
 
                 # Check if this is v3 or v2 access token.
                 if "created_at" in auth:
-
-                    # expires_in = datetime.utcfromtimestamp(
-                    #    auth["created_at"]
-                    # ) + timedelta(seconds=auth["expires_in"])
-                    # patched to test refresh
+                    # v2
                     expires_in = datetime.utcfromtimestamp(
                         auth["created_at"]
-                    ) + timedelta(seconds=500)
+                    ) + timedelta(seconds=auth["expires_in"])
+
                     self._sso_oauth["expires_in"] = expires_in
                     self.expires_in = expires_in
                 else:
+                    # v3
                     self._sso_oauth["expires_in"] = self._ttl_short_token
                     self.expires_in = self._ttl_short_token
                     self._sso_oauth["refresh_token"] = auth.get("refresh_token")
 
                 self.token_refreshed = True
-                _LOGGER.debug("Saving new auth info %s", self._sso_oauth)
+                # _LOGGER.debug("Saving new auth info %s", self._sso_oauth)
 
                 if self._new_token_callback:
-                    # This currently does not work as we sso_auth has datetime objects.
-                    # Beed need to convert them to mis or sec or what ever the api use.
-                    asyncio.create_task(
-                        self._new_token_callback(json.dumps(self._sso_oauth))
-                    )
+                    cb_data = deepcopy(self._sso_oauth)
+                    cb_data["expires_in"] = self.expires_in.isoformat()
+                    asyncio.create_task(self._new_token_callback(json.dumps(cb_data)))
 
     async def list_vehicles(self):
         v = await self.get("vehicles")
