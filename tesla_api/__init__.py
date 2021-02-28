@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import secrets
+import time
 from copy import deepcopy
 from datetime import datetime, timedelta
 from pprint import pprint
@@ -20,6 +21,7 @@ from .vehicle import Vehicle
 
 TESLA_API_BASE_URL = "https://owner-api.teslamotors.com/"
 API_URL = f"{TESLA_API_BASE_URL}api/1"
+STREAMING_URL = "wss://streaming.vn.teslamotors.com/streaming"
 
 V2TOKEN_URL = f"{TESLA_API_BASE_URL}oauth/token"
 V3TOKEN_URL = "https://auth.tesla.com/oauth2/v3/token"
@@ -349,7 +351,7 @@ class TeslaApiClient:
         headers = self._get_headers()
         response_json = {}
 
-        #_LOGGER.debug("url %s headers: %s params:%s", url, headers, params)
+        # _LOGGER.debug("url %s headers: %s params:%s", url, headers, params)
 
         async with self._session.get(url, headers=headers, params=params) as resp:
             response_json = await resp.json()
@@ -467,3 +469,29 @@ class TeslaApiClient:
             for product in await self.get("products")
             if "energy_site_id" in product
         ]
+
+    async def streaming(self, vehicle_id, cb_data=None):
+        # vehicle_id
+        # 'id': 147289202581, 'vehicle_id': 1350840087,
+
+        self._ws = None
+        connected = False
+
+        access_token = self._sso_oauth["access_token"]
+        ws = await self._session.ws_connect(STREAMING_URL)
+
+        await ws.send_json(
+            data={
+                "msg_type": "data:subscribe_oauth",
+                "token": access_token,
+                "value": "shift_state,speed,power,est_lat,est_lng,est_heading,est_corrected_lat,est_corrected_lng,native_latitude,native_longitude,native_heading,native_type,native_location_supported",
+                "tag": f"{vehicle_id}",
+                "created:timestamp": round(time.time() * 1000),
+            }
+        )
+
+        async for message in ws:
+            _LOGGER.debug("Raw message %s", message)
+            if message.type == aiohttp.WSMsgType.BINARY:
+                msg_json = json.loads(message.data)
+                _LOGGER.debug("JSON %s", msg_json)
