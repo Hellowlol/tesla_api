@@ -1,5 +1,16 @@
 """Misc helpers."""
+import asyncio
+import inspect
 from typing import Optional, Union
+
+
+def execute_callback(cb, arg):
+    if inspect.iscoroutinefunction(cb):
+        cb = cb(arg)
+    else:
+        loop = asyncio.get_running_loop()
+        cb = loop.run_in_executor(None, cb, arg)
+    asyncio.ensure_future(cb)
 
 
 class Dict(dict):  # type: ignore

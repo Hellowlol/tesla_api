@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+import time
 from datetime import datetime
 from typing import Optional, Union
 
@@ -13,7 +14,7 @@ from .controls import Controls
 from .exceptions import ApiError, VehicleUnavailableError
 from .gui import Gui
 from .media import Media
-from .misc import Dict, mile_to_km
+from .misc import Dict, execute_callback, mile_to_km
 from .state import State
 
 _LOGGER = logging.getLogger(__name__)
@@ -194,7 +195,7 @@ class Vehicle:
         self._data.update(state)
 
         if self._api_client.callback_update is not None:
-            asyncio.create_task(self._api_client.callback_update(self))
+            execute_callback(self._api_client.callback_update, self)
 
     async def nearby_charging_sites(self):
         """Get nearby charging sites"""
@@ -293,10 +294,13 @@ class Vehicle:
                 timeout = self._api_client.timeout
             delay = timeout / 100
 
+        #_LOGGER.debug("delay %s", delay)
+
         async def _wake():
             """real wake command."""
             part_url = f"vehicles/{self.id}/wake_up"
             state = await self._api_client.post(part_url)
+            #_LOGGER.debug("wake state %s", state)
             self._update_vehicle(state)
             while self._data["state"] != "online":
                 await asyncio.sleep(delay)
@@ -304,7 +308,7 @@ class Vehicle:
                 self._update_vehicle(state)
 
         if self._api_client.callback_wake_up is not None:
-            asyncio.create_task(self._api_client.callback_wake_up(self))
+            execute_callback(self._api_client.callback_wake_up, self)
 
         try:
             await asyncio.wait_for(_wake(), timeout)
@@ -422,6 +426,11 @@ class Vehicle:
         return self._data["id"]
 
     @property
+    def vehicle_id(self) -> str:
+        """The id used for the car used by other endpoints. like streaming and summon."""
+        return self._data["vehicle_id"]
+
+    @property
     def id_s(self):
         return self._data["id_s"]
 
@@ -464,3 +473,11 @@ class Vehicle:
 
         """
         return self._data["option_codes"].split(",")
+
+    async def streaming(self, cb_data=None, cb_disconnect=None):
+        """Stream updates using websocked and updates the attrs of the class."""
+        await asyncio.create_task(
+            self._api_client.streaming(
+                self, cb_data=cb_data, cb_disconnect=cb_disconnect
+            )
+        )

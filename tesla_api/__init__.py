@@ -1,11 +1,13 @@
 import asyncio
 import base64
 import hashlib
+import inspect
 import json
 import logging
 import re
 import secrets
 import time
+from collections import defaultdict
 from copy import deepcopy
 from datetime import datetime, timedelta
 from pprint import pprint
@@ -17,6 +19,7 @@ from .energy import Energy
 from .exceptions import (ApiError, AuthenticationBlockedError,
                          AuthenticationError, MissingCredentials,
                          VehicleUnavailableError)
+from .misc import execute_callback
 from .vehicle import Vehicle
 
 TESLA_API_BASE_URL = "https://owner-api.teslamotors.com/"
@@ -34,12 +37,13 @@ V2OAUTH_CLIENT_ID = "81527cff06843c8634fdc09e8ac0abefb46ac849f38fe1e431c2ef21067
 EPOCH = datetime.fromtimestamp(0)
 
 _LOGGER = logging.getLogger(__name__)
+SLEEP = 12
 
 
 class TeslaApiClient:
     callback_update = None  # Called when vehicle's state has been updated.
     callback_wake_up = None  # Called when attempting to wake a vehicle.
-    timeout = 30  # Default timeout for operations such as Vehicle.wake_up().
+    timeout = 60  # Default timeout for operations such as Vehicle.wake_up().
 
     def __init__(
         self,
@@ -75,6 +79,8 @@ class TeslaApiClient:
         self.long_live_token = long_live_token
         self._mfa_code = mfa_code
         self._ttl_short_token = EPOCH
+        self._ws = None
+        self._id_map = {}
 
         if session is None:
             self._session = aiohttp.ClientSession()
@@ -141,7 +147,7 @@ class TeslaApiClient:
                 idents = passcode.keys()[0]
 
                 for device in devices:
-                    for key, value in device.items():
+                    for key, _ in device.items():
                         if key == idents:
                             factor_id = device["id"]
         else:
@@ -255,7 +261,6 @@ class TeslaApiClient:
                     )
                     _LOGGER.debug("possible errors %s", errors)
                     raise AuthenticationError(errors.get("_", errors))
-                    _LOGGER.debug("%s", page)
 
                 redirect_location = resp.headers["Location"]
                 args = parse_qs(urlparse(redirect_location).query)
@@ -310,13 +315,14 @@ class TeslaApiClient:
             V3_AUTH_TOKEN_URL_EXCHANGE,
             data=oauth,
         )
+        data = await auth.json()
 
         # patched to test refresh
         # self._ttl_short_token = datetime.utcnow() + timedelta(seconds=60)
         self._ttl_short_token = datetime.utcnow() + timedelta(
-            seconds=auth.get("expires_in", 300)
+            seconds=data.get("expires_in", 300)
         )
-        data = await auth.json()
+
 
         if self.long_live_token is True:
             # Use v3 access_token to get a bearer token thats valid 45 days
@@ -351,7 +357,7 @@ class TeslaApiClient:
         headers = self._get_headers()
         response_json = {}
 
-        # _LOGGER.debug("url %s headers: %s params:%s", url, headers, params)
+        _LOGGER.debug("url %s headers: %s params:%s", url, headers, params)
 
         async with self._session.get(url, headers=headers, params=params) as resp:
             response_json = await resp.json()
@@ -453,11 +459,19 @@ class TeslaApiClient:
                 if self._new_token_callback:
                     cb_data = deepcopy(self._sso_oauth)
                     cb_data["expires_in"] = self.expires_in.isoformat()
-                    asyncio.create_task(self._new_token_callback(json.dumps(cb_data)))
+                    execute_callback(self._new_token_callback, json.dumps(cb_data))
 
     async def list_vehicles(self):
-        v = await self.get("vehicles")
-        return [Vehicle(self, vehicle) for vehicle in await self.get("vehicles")]
+        result = []
+
+        for vehicle in await self.get("vehicles"):
+            v = Vehicle(self, vehicle)
+            self._id_map[v.vehicle_id] = v
+            self._id_map[v.id] = v
+            self._id_map[v.vin] = v
+            result.append(v)
+
+        return result
 
     async def get_vehicle(self, name):
         list_vehicles = await self.list_vehicles()
@@ -470,28 +484,136 @@ class TeslaApiClient:
             if "energy_site_id" in product
         ]
 
-    async def streaming(self, vehicle_id, cb_data=None):
-        # vehicle_id
-        # 'id': 147289202581, 'vehicle_id': 1350840087,
-
-        self._ws = None
-        connected = False
+    async def streaming(self, vehicle_id, cb_data=None, cb_disconnect=None):
+        use_obj = False
+        vehicle = None
+        auth_error = False
 
         access_token = self._sso_oauth["access_token"]
-        ws = await self._session.ws_connect(STREAMING_URL)
 
-        await ws.send_json(
-            data={
-                "msg_type": "data:subscribe_oauth",
-                "token": access_token,
-                "value": "shift_state,speed,power,est_lat,est_lng,est_heading,est_corrected_lat,est_corrected_lng,native_latitude,native_longitude,native_heading,native_type,native_location_supported",
-                "tag": f"{vehicle_id}",
-                "created:timestamp": round(time.time() * 1000),
-            }
-        )
+        if isinstance(vehicle_id, Vehicle):
+            vehicle = vehicle_id
+            vehicle_id = vehicle_id.vehicle_id
+            use_obj = True
 
-        async for message in ws:
-            _LOGGER.debug("Raw message %s", message)
-            if message.type == aiohttp.WSMsgType.BINARY:
-                msg_json = json.loads(message.data)
-                _LOGGER.debug("JSON %s", msg_json)
+        data_map = [
+                # requested_name, datetype, store key, alias
+                ("timestamp", int, "drive_state", ""),
+                ("shift_state", str, "drive_state", ""),
+                ("speed", int, "drive_state", ""),
+                ("power", int, "drive_state", ""),
+                # Lets start with a new first.
+                #("est_lat", float, "drive_state", ""),
+                #("est_lng", float, "drive_state", ""),
+                #("est_heading", int, "drive_state", "heading"),
+                #("est_corrected_lat", float, "drive_state", "latitude"),
+                #("est_corrected_lng", float, "drive_state", "longitude"),
+                #("native_latitude", float, "drive_state", ""),
+                #("native_longitude", float, "drive_state", ""),
+                #("native_heading", float, "drive_state", ""),
+                #("native_type", str, "drive_state", ""),
+                #("native_location_supported", int, "drive_state", ""),
+                ("soc", int, "charge_state", "battery_level"),
+                # Is does this even work?
+                #("elevation", int),
+                ("range", int, "charge_state", "battery_range"),
+                ("est_range", int, "charge_state", "est_battery_range"),
+                ("odometer", float, "vehicle_state", "")
+        ]
+
+        if use_obj:
+            if not vehicle_id in self._id_map:
+                await self.list_vehicles()
+
+            # for now just force a a full update.
+            # later we should add default for Dict.
+            for v in self._id_map.values():
+                await v.full_update()
+
+        # This is not added in the loop just so we dont lock the account.
+        if self._ws is None or self._ws.closed:
+            self._ws = await self._session.ws_connect(STREAMING_URL)
+
+        keys =  [v[0] for v in data_map]
+        v_str = ','.join(keys)
+        _LOGGER.debug("v_str %s", v_str)
+        #"shift_state,speed,power,est_lat,est_lng,est_heading,est_corrected_lat,est_corrected_lng,native_latitude,native_longitude,native_heading,native_type,native_location_supported",
+
+        while True and auth_error is False:
+            await self._ws.send_json(
+                data={
+                    "msg_type": "data:subscribe_oauth",
+                    "token": access_token,
+                    "value": v_str,
+                    "tag": f"{vehicle_id}",
+                    "created:timestamp": round(time.time() * 1000),
+                }
+            )
+
+            async for message in self._ws:
+                _LOGGER.debug("Raw message %s", message)
+                if message.type == aiohttp.WSMsgType.BINARY:
+                    data = json.loads(message.data)
+                    _LOGGER.debug("JSON %s", data)
+                    data_dict = defaultdict(dict)
+                    error_type = data.get("error_type")
+
+                    if data["msg_type"] == "data:update":
+                        _LOGGER.debug("GOT data update")
+                        last_data_update_time = time.time()
+
+                    elif data["msg_type"] == "control:hello":
+                        _LOGGER.debug("Connected")
+
+                    elif data["msg_type"] == "data:error":
+                        if data["value"] == "Can't validate token. ":
+                            auth_error = True
+                            raise AuthenticationError
+
+                        elif data["value"] == "disconnected":
+                            _LOGGER.debug("Car disconnect")
+                            if cb_disconnect is not None:
+                                execute_callback(cb_disconnect, data)
+                                # should we break here?
+
+                        else:
+                            # Some unknown error.
+                            _LOGGER.debug("Some crappy error %s", error_type)
+                            break
+
+                    #vehicle = self._id_map.get(int(tag))
+                    if data["msg_type"] == "data:update":
+                        values = data["value"].split(",")
+                        _LOGGER.debug("len values %s", len(values))
+                        _LOGGER.debug("values %s", values)
+
+                        # check for tesla junk
+                        if len(values) - len(data_map) == 1:
+                            junk = values.pop(1)
+                            _LOGGER.debug("Removed junk %r", junk)
+
+                        for i, value in enumerate(values):
+                            _LOGGER.debug("i %s, key %s value %r type %s", i, data_map[i][0], value, type(value))
+                            if value:
+                                key, data_type, storage_key, alias = data_map[i]
+                                rk = alias or key
+
+                                data_dict[rk] = data_type(value)
+
+                                if use_obj:
+                                    if rk in vehicle._data[storage_key]:
+                                        _LOGGER.debug("update from streaming %s %s", rk, value)
+                                        vehicle._data[storage_key][rk] = data_type(value)
+
+                                    else:
+                                        _LOGGER.debug("didnt update as key %s in not in vehicle._data", rk)
+
+
+                    if cb_data is not None and data_dict:
+                        execute_callback(cb_data, data_dict)
+
+                elif message.type == aiohttp.WSMsgType.ERROR:
+                    _LOGGER.debug("WSMsgType error")
+                    break
+        _LOGGER.debug("Sleeping for %s")
+        await asyncio.sleep(SLEEP)
