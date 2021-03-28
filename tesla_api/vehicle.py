@@ -64,6 +64,7 @@ class Vehicle:
         self.gui = Gui(self)
         self.status = State(self)
         self.config = Config(self)
+        self._stream_task = None
 
     async def get_charge_state(self):
         """Get the charge state as a dict
@@ -306,6 +307,8 @@ class Vehicle:
                 await asyncio.sleep(delay)
                 state = await self._api_client.post(f"vehicles/{self.id}/wake_up")
                 self._update_vehicle(state)
+            else:
+                _LOGGER.debug("Woke the vehicle at %s", datetime.now())
 
         if self._api_client.callback_wake_up is not None:
             execute_callback(self._api_client.callback_wake_up, self)
@@ -470,14 +473,24 @@ class Vehicle:
         Note:
             These can not be trusted.
 
-
         """
         return self._data["option_codes"].split(",")
 
     async def streaming(self, cb_data=None, cb_disconnect=None):
         """Stream updates using websocked and updates the attrs of the class."""
-        await asyncio.create_task(
+        await self.cancel_streaming()
+        self._stream_task = asyncio.create_task(
             self._api_client.streaming(
                 self, cb_data=cb_data, cb_disconnect=cb_disconnect
             )
         )
+    
+    async def cancel_streaming(self):
+        if self._stream_task is not None:
+            self._stream_task.cancel()
+            try:
+                await self._stream_task
+                self._stream_task = None
+            except asyncio.CancelledError:
+                pass
+

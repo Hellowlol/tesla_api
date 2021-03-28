@@ -323,7 +323,6 @@ class TeslaApiClient:
             seconds=data.get("expires_in", 300)
         )
 
-
         if self.long_live_token is True:
             # Use v3 access_token to get a bearer token thats valid 45 days
             lt_token_data = await self.get_bearer_token(data["access_token"])
@@ -347,7 +346,6 @@ class TeslaApiClient:
             "Authorization": f"Bearer {access_token}",
         }
         auth = await self._session.post(V2TOKEN_URL, headers=head, data=oauth)
-
         return await auth.json()
 
     async def get(self, endpoint, params=None):
@@ -357,7 +355,7 @@ class TeslaApiClient:
         headers = self._get_headers()
         response_json = {}
 
-        _LOGGER.debug("url %s headers: %s params:%s", url, headers, params)
+        # _LOGGER.debug("url %s headers: %s params:%s", url, headers, params)
 
         async with self._session.get(url, headers=headers, params=params) as resp:
             response_json = await resp.json()
@@ -429,6 +427,8 @@ class TeslaApiClient:
                     refresh_token=self._sso_oauth.get("refresh_token")
                 )
 
+            auth = await self.get_bearer_token(auth["access_token"])
+
             if auth:
                 self._sso_oauth = {
                     "access_token": auth["access_token"],
@@ -447,14 +447,16 @@ class TeslaApiClient:
 
                     self._sso_oauth["expires_in"] = expires_in
                     self.expires_in = expires_in
+                    self._sso_oauth["token_version"] = "v2"
                 else:
                     # v3
                     self._sso_oauth["expires_in"] = self._ttl_short_token
                     self.expires_in = self._ttl_short_token
                     self._sso_oauth["refresh_token"] = auth.get("refresh_token")
+                    self._sso_oauth["token_version"] = "v3"
 
                 self.token_refreshed = True
-                # _LOGGER.debug("Saving new auth info %s", self._sso_oauth)
+                _LOGGER.debug("Saving new auth info %s", self._sso_oauth)
 
                 if self._new_token_callback:
                     cb_data = deepcopy(self._sso_oauth)
@@ -488,8 +490,14 @@ class TeslaApiClient:
         use_obj = False
         vehicle = None
         auth_error = False
-
-        access_token = self._sso_oauth["access_token"]
+        access_token = self._sso_oauth.get("access_token")
+        if access_token is None:
+            await self.check_auth()
+            token_version = self._sso_oauth["token_version"]
+            if token_version == "v3":
+                access_token = self.get_bearer_token(self._sso_oauth.get("access_token"))
+            else:
+                access_token = self._sso_oauth.get("access_token")
 
         if isinstance(vehicle_id, Vehicle):
             vehicle = vehicle_id
@@ -497,28 +505,28 @@ class TeslaApiClient:
             use_obj = True
 
         data_map = [
-                # requested_name, datetype, store key, alias
-                ("timestamp", int, "drive_state", ""),
-                ("shift_state", str, "drive_state", ""),
-                ("speed", int, "drive_state", ""),
-                ("power", int, "drive_state", ""),
-                # Lets start with a new first.
-                #("est_lat", float, "drive_state", ""),
-                #("est_lng", float, "drive_state", ""),
-                #("est_heading", int, "drive_state", "heading"),
-                #("est_corrected_lat", float, "drive_state", "latitude"),
-                #("est_corrected_lng", float, "drive_state", "longitude"),
-                #("native_latitude", float, "drive_state", ""),
-                #("native_longitude", float, "drive_state", ""),
-                #("native_heading", float, "drive_state", ""),
-                #("native_type", str, "drive_state", ""),
-                #("native_location_supported", int, "drive_state", ""),
-                ("soc", int, "charge_state", "battery_level"),
-                # Is does this even work?
-                #("elevation", int),
-                ("range", int, "charge_state", "battery_range"),
-                ("est_range", int, "charge_state", "est_battery_range"),
-                ("odometer", float, "vehicle_state", "")
+            # requested_name, datetype, store key, alias
+            ("timestamp", int, "drive_state", ""),
+            ("shift_state", str, "drive_state", ""),
+            ("speed", int, "drive_state", ""),
+            ("power", int, "drive_state", ""),
+            # Lets start with a new first.
+            ("est_lat", float, "drive_state", ""),
+            ("est_lng", float, "drive_state", ""),
+            ("est_heading", int, "drive_state", "heading"),
+            ("est_corrected_lat", float, "drive_state", "latitude"),
+            ("est_corrected_lng", float, "drive_state", "longitude"),
+            # ("native_latitude", float, "drive_state", ""),
+            # ("native_longitude", float, "drive_state", ""),
+            # ("native_heading", float, "drive_state", ""),
+            # ("native_type", str, "drive_state", ""),
+            # ("native_location_supported", int, "drive_state", ""),
+            ("soc", int, "charge_state", "battery_level"),
+            # Is does this even work?
+            ("elevation", int, "drive_state", ""),
+            #("range", int, "charge_state", "battery_range"),
+            # ("est_range", int, "charge_state", "est_battery_range"),
+            # ("odometer", float, "vehicle_state", "")
         ]
 
         if use_obj:
@@ -532,57 +540,66 @@ class TeslaApiClient:
 
         # This is not added in the loop just so we dont lock the account.
         if self._ws is None or self._ws.closed:
-            self._ws = await self._session.ws_connect(STREAMING_URL)
+           self._ws = await self._session.ws_connect(STREAMING_URL)
 
-        keys =  [v[0] for v in data_map]
-        v_str = ','.join(keys)
+        keys = [v[0] for v in data_map]
+        v_str = ",".join(keys)
         _LOGGER.debug("v_str %s", v_str)
-        #"shift_state,speed,power,est_lat,est_lng,est_heading,est_corrected_lat,est_corrected_lng,native_latitude,native_longitude,native_heading,native_type,native_location_supported",
+        NN = 0
 
         while True and auth_error is False:
-            await self._ws.send_json(
-                data={
+            _LOGGER.debug("NN %s", NN)
+            NN += 1
+
+            # This is not added in the loop just so we dont lock the account.
+            if self._ws is None or self._ws.closed:
+                _LOGGER.debug("Trying to connect to ws %s", STREAMING_URL)
+                self._ws = await self._session.ws_connect(STREAMING_URL)
+
+            FFF = {
                     "msg_type": "data:subscribe_oauth",
                     "token": access_token,
                     "value": v_str,
                     "tag": f"{vehicle_id}",
                     "created:timestamp": round(time.time() * 1000),
                 }
-            )
+            _LOGGER.debug("Sending %s", FFF)
+            auth_resp = await self._ws.send_json(data=FFF)
 
             async for message in self._ws:
                 _LOGGER.debug("Raw message %s", message)
+
                 if message.type == aiohttp.WSMsgType.BINARY:
                     data = json.loads(message.data)
                     _LOGGER.debug("JSON %s", data)
                     data_dict = defaultdict(dict)
                     error_type = data.get("error_type")
 
-                    if data["msg_type"] == "data:update":
-                        _LOGGER.debug("GOT data update")
-                        last_data_update_time = time.time()
-
-                    elif data["msg_type"] == "control:hello":
+                    if data["msg_type"] == "control:hello":
                         _LOGGER.debug("Connected")
 
                     elif data["msg_type"] == "data:error":
                         if data["value"] == "Can't validate token. ":
                             auth_error = True
-                            raise AuthenticationError
+                            raise AuthenticationError(data["value"])
 
                         elif data["value"] == "disconnected":
                             _LOGGER.debug("Car disconnect")
                             if cb_disconnect is not None:
                                 execute_callback(cb_disconnect, data)
-                                # should we break here?
+                                break
+
+                        elif data["value"] == "timeout":
+                            _LOGGER.debug("Timeout")
 
                         else:
                             # Some unknown error.
                             _LOGGER.debug("Some crappy error %s", error_type)
-                            break
 
-                    #vehicle = self._id_map.get(int(tag))
-                    if data["msg_type"] == "data:update":
+                    # vehicle = self._id_map.get(int(tag))
+                    elif data["msg_type"] == "data:update":
+                        _LOGGER.debug("GOT data update")
+                        last_data_update_time = time.time()
                         values = data["value"].split(",")
                         _LOGGER.debug("len values %s", len(values))
                         _LOGGER.debug("values %s", values)
@@ -593,21 +610,33 @@ class TeslaApiClient:
                             _LOGGER.debug("Removed junk %r", junk)
 
                         for i, value in enumerate(values):
-                            _LOGGER.debug("i %s, key %s value %r type %s", i, data_map[i][0], value, type(value))
+                            _LOGGER.debug(
+                                "i %s, key %s value %r type %s",
+                                i,
+                                data_map[i][0],
+                                value,
+                                type(value),
+                            )
+
                             if value:
                                 key, data_type, storage_key, alias = data_map[i]
                                 rk = alias or key
-
                                 data_dict[rk] = data_type(value)
 
                                 if use_obj:
                                     if rk in vehicle._data[storage_key]:
-                                        _LOGGER.debug("update from streaming %s %s", rk, value)
-                                        vehicle._data[storage_key][rk] = data_type(value)
+                                        _LOGGER.debug(
+                                            "update from streaming %s %s", rk, value
+                                        )
+                                        vehicle._data[storage_key][rk] = data_type(
+                                            value
+                                        )
 
                                     else:
-                                        _LOGGER.debug("didnt update as key %s in not in vehicle._data", rk)
-
+                                        _LOGGER.debug(
+                                            "didnt update as key %s in not in vehicle._data",
+                                            rk,
+                                        )
 
                     if cb_data is not None and data_dict:
                         execute_callback(cb_data, data_dict)
@@ -615,5 +644,7 @@ class TeslaApiClient:
                 elif message.type == aiohttp.WSMsgType.ERROR:
                     _LOGGER.debug("WSMsgType error")
                     break
-        _LOGGER.debug("Sleeping for %s")
-        await asyncio.sleep(SLEEP)
+
+            _LOGGER.debug("Sleeping for %s", SLEEP)
+            await asyncio.sleep(SLEEP)
+        _LOGGER.debug("Exit websocket.")

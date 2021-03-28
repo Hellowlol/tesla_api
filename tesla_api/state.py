@@ -63,12 +63,19 @@ class State(Stub):
         return self._vehicle._data[self.__key]["shift_state"]
 
     @property
+    def elevation(self):
+        """This only seems to be included in the streaming api, cant be pulled atm."""
+        return self._vehicle._data.get("elevation")
+
+
+    @property
     def speed(self) -> Optional[Union[None, int, float]]:
         """Speed in unit format of the cars
            #TODO check this.
 
         """
-        return self._vehicle._data[self.__key]["speed"]
+        spd = self._vehicle._data[self.__key]["speed"]
+        return self._vehicle._format_distance_unit(spd)
 
     @property
     def last_update(self) -> datetime:
